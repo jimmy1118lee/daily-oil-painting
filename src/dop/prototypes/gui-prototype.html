@@ -1,0 +1,23 @@
+<!doctype html>
+<!-- 原型问题：桌面控制面板应该是什么样？A/B/C 三种结构，通过 ?variant= 与底部切换器比较。与真实引擎和配置完全隔离。 -->
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>每日油画 · 控制面板原型</title>
+  <link rel="stylesheet" href="prototype.css">
+</head>
+<body>
+  <header class="presentation"><div><span id="direction-key">方案 A</span><strong id="direction-name">浅色画廊</strong></div><p>每日欧洲油画壁纸 <span>／ 界面原型</span></p></header>
+  <main id="prototype-root" aria-label="桌面软件界面原型"></main>
+  <div id="prototype-switcher" class="prototype-switcher" aria-label="切换原型方案">
+    <button data-cycle="-1" aria-label="上一个方案">←</button>
+    <div><span>界面原型</span><strong id="variant-label">A · 浅色画廊</strong></div>
+    <button data-cycle="1" aria-label="下一个方案">→</button>
+    <i></i><small>← → 切换方案 · 操作不会更改真实壁纸</small>
+  </div>
+  <div id="modal-root"></div>
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  <script src="prototype.js"></script>
+</body>
+</html>
