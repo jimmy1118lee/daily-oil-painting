@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import gc
 import os
 from pathlib import Path
 import sys
@@ -23,6 +24,8 @@ from dop.util import atomic_write_json
 
 class GalleryTests(unittest.TestCase):
     def setUp(self):
+        # 旧 Tk 对象只能在主线程释放，避免后台渲染触发跨用例的循环垃圾回收。
+        gc.collect()
         folder = tempfile.TemporaryDirectory(prefix="dop-gallery-")
         self.addCleanup(folder.cleanup)
         self.directory = Path(folder.name)
@@ -52,8 +55,14 @@ class GalleryTests(unittest.TestCase):
         self.root = tk.Tk()
         self.root.withdraw()
         self.panel = ControlPanel(self.root)
-        self.addCleanup(self.root.destroy)
+        self.addCleanup(self.close_panel)
         self.root.update()
+
+    def close_panel(self):
+        self.root.destroy()
+        self.panel = None
+        self.root = None
+        gc.collect()
 
     def pump(self, until=lambda: True):
         deadline = time.monotonic() + 3
@@ -208,6 +217,51 @@ class GalleryTests(unittest.TestCase):
         with patch("dop.autostart.subprocess.run", return_value=result) as run:
             autostart._run(["schtasks", "/query"])
         self.assertTrue(run.call_args.kwargs.get("creationflags", 0) & subprocess.CREATE_NO_WINDOW)
+
+    def test_favorite_portrait_applies_offline_from_saved_original(self):
+        favorite = paths.favorites_dir() / "20261020_flowers.jpg"
+        original = favorite.with_name(favorite.stem + "_原图.jpg")
+        Image.new("RGB", (320, 180), "green").save(favorite)
+        Image.new("RGB", (80, 160), "red").save(original)
+        record = {**self.records[0], "favorite_file": str(favorite),
+                  "source_file": str(self.directory / "evicted.jpg")}
+        atomic_write_json(paths.favorites_index_path(), [record])
+        # 新作品目录没有本地收藏字段，验证 GUI 不会在补齐元数据时丢掉它们。
+        canonical = {key: value for key, value in record.items()
+                     if key not in ("favorite_file", "source_file", "wallpaper_file")}
+        atomic_write_json(paths.catalog_path(), {"works": [canonical]})
+        screen = dict(left=0, top=0, right=320, bottom=180, width=320, height=180, primary=True)
+        with patch.object(self.panel.engine.http, "download", side_effect=RuntimeError("模拟网络断开")) as download, \
+             patch("dop.wallpaper.get_monitors", return_value=[screen]), \
+             patch("dop.wallpaper.set_wallpaper") as setter, \
+             patch("dop.gui.messagebox.showerror") as error:
+            self.panel.show_view("favorites")
+            self.panel.ui.apply_button.invoke()
+            self.pump(lambda: not self.panel.busy)
+        error.assert_not_called()
+        download.assert_not_called()
+        setter.assert_called_once()
+        self.assertEqual(self.panel.engine.current()["source_file"], str(original))
+        self.assertTrue(load_config()["selection"]["landscape_only"])
+
+    def test_favorite_can_use_saved_wallpaper_when_original_is_missing(self):
+        favorite = paths.favorites_dir() / "only-wallpaper.jpg"
+        Image.new("RGB", (320, 180), "blue").save(favorite)
+        record = {**self.records[0], "favorite_file": str(favorite),
+                  "source_file": str(self.directory / "missing.jpg")}
+        atomic_write_json(paths.favorites_index_path(), [record])
+        screen = dict(left=0, top=0, right=320, bottom=180, width=320, height=180, primary=True)
+        with patch.object(self.panel.engine.http, "download", side_effect=RuntimeError("模拟断网")) as download, \
+             patch("dop.wallpaper.get_monitors", return_value=[screen]), \
+             patch("dop.wallpaper.set_wallpaper") as setter, \
+             patch("dop.gui.messagebox.showerror") as error:
+            self.panel.show_view("favorites")
+            self.panel.ui.apply_button.invoke()
+            self.pump(lambda: not self.panel.busy)
+        error.assert_not_called()
+        download.assert_not_called()
+        setter.assert_called_once()
+        self.assertEqual(self.panel.engine.current()["source_file"], str(favorite))
 
 
 if __name__ == "__main__":

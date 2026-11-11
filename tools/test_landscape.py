@@ -18,7 +18,7 @@ from PIL import Image
 from dop import paths
 from dop.config import DEFAULT_CONFIG
 from dop.engine import MAX_ORIENTATION_CHECKS, Engine, PortraitImageError, _image_cache_path
-from dop.util import atomic_write_json
+from dop.util import atomic_write_json, read_json
 
 
 def work(number):
@@ -112,18 +112,39 @@ class LandscapeTests(unittest.TestCase):
         self.multi_setter.assert_not_called()
         self.assertEqual(list(paths.wallpaper_dir().iterdir()), [])
 
-    def test_explicit_portrait_is_rejected_before_rendering(self):
+    def test_explicit_portrait_is_allowed_without_disabling_automatic_filter(self):
         with patch.object(self.engine, "download", return_value=self.portrait):
-            with self.assertRaises(PortraitImageError):
-                self.engine.apply(work=work(1))
-        self.setter.assert_not_called()
-        self.assertIsNone(self.engine.current())
+            record = self.engine.apply(work=work(1))
+        self.assertEqual(record["key"], "met:1")
+        self.setter.assert_called_once()
+        self.assertTrue(self.cfg["selection"]["landscape_only"])
 
     def test_explicit_landscape_is_applied(self):
         with patch.object(self.engine, "download", return_value=self.landscape):
             record = self.engine.apply(work=work(1))
         self.assertEqual(record["key"], "met:1")
         self.setter.assert_called_once()
+
+    def test_manual_history_work_uses_local_image_offline(self):
+        selected = {**work(1), "source_file": str(self.portrait)}
+        with patch.object(self.engine, "download") as download:
+            record = self.engine.apply(work=selected)
+        download.assert_not_called()
+        self.assertEqual(record["source_file"], str(self.portrait))
+        self.assertTrue(self.cfg["selection"]["landscape_only"])
+
+    def test_favorite_records_saved_original_and_can_be_reused(self):
+        with patch.object(self.engine, "download", return_value=self.landscape):
+            self.engine.apply(work=work(1))
+        self.engine.favorite()
+        saved = read_json(paths.favorites_index_path())[-1]
+        original = Path(saved["favorite_source_file"])
+        self.assertTrue(original.is_file())
+        self.assertEqual(original.read_bytes(), self.landscape.read_bytes())
+        self.engine.apply(work=saved)
+        self.assertEqual(self.engine.current()["source_file"], str(original))
+        # 当天再次收藏已保存的原图，不应发生文件复制到自身的异常。
+        self.assertIsNotNone(self.engine.favorite())
 
     def test_square_is_not_misclassified_as_portrait(self):
         self.engine._check_orientation(work(1), self.image("square.jpg", (100, 100)))
@@ -171,8 +192,7 @@ class LandscapeTests(unittest.TestCase):
 
     def test_setting_can_restore_original_selection_behavior(self):
         self.cfg["selection"]["landscape_only"] = False
-        with patch.object(self.engine, "download", return_value=self.portrait):
-            record = self.engine.apply(work=work(1))
+        record = self.run_apply([work(1)], lambda *args, **kwargs: self.portrait)
         self.assertEqual(record["key"], "met:1")
 
 

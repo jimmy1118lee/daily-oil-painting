@@ -133,7 +133,7 @@ class ArtworkPreview(tk.Canvas):
     def set_record(self, record: Optional[dict]):
         record = record or {}
         candidates = []
-        for key in ("source_file", "favorite_file", "wallpaper_file", "canvas_file"):
+        for key in ("favorite_source_file", "source_file", "favorite_file", "wallpaper_file", "canvas_file"):
             value = record.get(key)
             if value:
                 path = Path(str(value))

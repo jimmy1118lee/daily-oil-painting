@@ -62,6 +62,32 @@ def _display_size(path: Path) -> tuple[int, int]:
         return width, height
 
 
+def _local_work_image(work: dict) -> Optional[Path]:
+    """手动选画优先读取已收藏原图，兼容旧收藏；最后才使用壁纸成品。"""
+    candidates = []
+    if work.get("favorite_source_file"):
+        candidates.append(Path(str(work["favorite_source_file"])))
+    favorite = Path(str(work["favorite_file"])) if work.get("favorite_file") else None
+    if favorite:
+        # 旧版收藏只记录成品路径，但原图按固定命名规则保存在同一文件夹。
+        suffixes = [Path(str(work.get("source_file") or "")).suffix, ".jpg", ".jpeg", ".png", ".webp"]
+        candidates.extend(favorite.with_name(favorite.stem + "_原图" + suffix)
+                          for suffix in dict.fromkeys(suffixes) if suffix)
+    if work.get("source_file"):
+        candidates.append(Path(str(work["source_file"])))
+    if favorite:
+        candidates.append(favorite)
+    for path in dict.fromkeys(candidates):
+        try:
+            if path.is_file():
+                with Image.open(path) as image:
+                    image.verify()
+                return path
+        except (OSError, ValueError, Image.DecompressionBombError):
+            continue
+    return None
+
+
 def _noop(_msg: str) -> None:
     return None
 
@@ -277,11 +303,19 @@ class Engine:
                     f"尝试 {failures} 幅仍取不到可用图片，最后一次错误：{last_error}"
                 )
         else:
-            say(f"正在下载《{work.get('title')}》…")
-            source_file = self.download(work, force=force_new)
-            self._check_orientation(work, source_file)
+            source_file = None if force_new else _local_work_image(work)
+            if source_file is None:
+                say(f"正在下载《{work.get('title')}》…")
+                source_file = self.download(work, force=force_new)
+            else:
+                say(f"正在读取本地画作《{work.get('title')}》…")
+            # 显式选中的画作代表用户意愿；方向筛选只限制自动/随机轮换。
 
         say("正在渲染壁纸…")
+        render_cfg = self.cfg
+        if work.get("favorite_file") and source_file.resolve() == Path(str(work["favorite_file"])).resolve():
+            # 只剩收藏的壁纸成品时，其中已有署名，重排时不要再叠加一份。
+            render_cfg = {**self.cfg, "image": {**(self.cfg.get("image") or {}), "show_caption": False}}
         monitors = wallpaper.get_monitors()
         multi = len(monitors) > 1
         # 多屏布局策略：
@@ -291,7 +325,7 @@ class Engine:
         #   span        —— 整张跨屏图切分。
         mode = str((self.cfg.get("image") or {}).get("multi_monitor") or "each").lower()
         if multi and mode in ("primary", "span"):
-            canvas = render.compose(source_file, monitors, self.cfg, work)
+            canvas = render.compose(source_file, monitors, render_cfg, work)
             slices = render.split_by_monitor(canvas, monitors)
         else:
             slices = []
@@ -300,12 +334,12 @@ class Engine:
                 local.update(
                     left=0, top=0, right=monitor["width"], bottom=monitor["height"], primary=True
                 )
-                slices.append((monitor, render.compose(source_file, [local], self.cfg, work)))
+                slices.append((monitor, render.compose(source_file, [local], render_cfg, work)))
             # 单屏时切片本身就是整张成品，不必再渲染一遍
             canvas = (
                 slices[0][1]
                 if len(slices) == 1
-                else render.compose(source_file, monitors, self.cfg, work)
+                else render.compose(source_file, monitors, render_cfg, work)
             )
 
         suffix = render.suffix_for(self.cfg)
@@ -561,16 +595,22 @@ class Engine:
             self.log.warning("壁纸文件已不存在：%s", wall)
             return None
         target = paths.favorites_dir() / f"{name}{wall.suffix}"
-        shutil.copy2(wall, target)
+        if wall.resolve() != target.resolve():
+            shutil.copy2(wall, target)
 
         source = Path(str(record.get("source_file") or ""))
-        if source.exists():
-            shutil.copy2(source, paths.favorites_dir() / f"{name}_原图{source.suffix}")
+        favorite_source = None
+        if source.is_file():
+            favorite_source = paths.favorites_dir() / f"{name}_原图{source.suffix}"
+            if source.resolve() != favorite_source.resolve():
+                shutil.copy2(source, favorite_source)
 
         index = read_json(paths.favorites_index_path(), [])
         if not isinstance(index, list):
             index = []
-        index.append({**record, "favorite_file": str(target), "favorited_at": time.time()})
+        index.append({**record, "favorite_file": str(target),
+                      "favorite_source_file": str(favorite_source) if favorite_source else "",
+                      "favorited_at": time.time()})
         atomic_write_json(paths.favorites_index_path(), index)
         self.log.info("已收藏到 %s", target)
         return target

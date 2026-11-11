@@ -389,7 +389,9 @@ class ControlPanel:
         record = dict(self._selected_record)
         # 旧历史不含备用图片地址，优先从现有目录补齐，不强制联网重建。
         catalog = catalog_mod.load_catalog() or {}
-        work = next((item for item in catalog.get("works", []) if item.get("key") == record.get("key")), record)
+        canonical = next((item for item in catalog.get("works", []) if item.get("key") == record.get("key")), {})
+        # 补齐图源元数据时保留收藏原图/成品路径，不能把离线收藏变回网络图片。
+        work = {**record, **canonical}
         self.run_task("应用画作", lambda: self.engine.apply(work=work, progress=self._progress),
                       on_done=lambda: self.show_view("today"))
 
