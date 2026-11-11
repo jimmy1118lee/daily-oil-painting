@@ -1,11 +1,8 @@
-"""图形控制面板（tkinter，只用标准库）。
-
-托盘图标在 Windows 11 上默认会被收进"隐藏的图标"溢出区，甚至被系统更新重置，
-所以要有一个不依赖托盘的入口：双击桌面快捷方式打开这个窗口就能操作一切。
-"""
-
+"""B「深色观画」控制面板：界面状态、设置与后台任务；布局位于 gui_view。"""
 from __future__ import annotations
 
+import ctypes
+import os
 import queue
 import threading
 import traceback
@@ -15,519 +12,492 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import messagebox
 
-from PIL import Image, ImageTk
-
+from . import catalog as catalog_mod
 from . import paths, report, wallpaper
 from .config import load_config, save_config
 from .engine import Engine
-from .util import (
-    ensure_std_streams,
-    get_logger,
-    human_size,
-    next_target,
-    parse_hhmm,
-    setup_logging,
-)
-
-try:
-    RESAMPLE = Image.Resampling.LANCZOS
-except AttributeError:  # pragma: no cover
-    RESAMPLE = Image.LANCZOS
+from .gui_view import MUTED, STAGE, ArtworkPreview, GalleryView, SettingsView, configure_styles
+from .util import ensure_std_streams, get_logger, next_target, parse_hhmm, read_json, setup_logging
 
 TIME_PRESETS = ("06:30", "07:30", "08:30", "12:00", "18:00", "21:00", "23:00")
-BG = "#14141a"
-CARD = "#1d1d25"
-FG = "#e8e6e1"
-MUTED = "#9a968e"
-ACCENT = "#d9bd76"
 
 
 class ControlPanel:
-    def __init__(self, root: tk.Tk) -> None:
-        self.log = get_logger("gui")
+    multi_modes = {"每屏完整显示": "each", "画作放主屏": "primary", "跨屏展开": "span"}
+    image_styles = {"完整显示": "fit", "铺满屏幕": "fill", "原尺寸居中": "center", "自动选择": "auto"}
+    time_presets = TIME_PRESETS
+
+    def __init__(self, root: tk.Tk):
         self.root = root
+        self.log = get_logger("gui")
+        self.log_path = paths.log_path()
         self.engine = Engine()
         self.events: queue.Queue[tuple[str, Any]] = queue.Queue()
         self.busy = False
-        self._photo: Optional[ImageTk.PhotoImage] = None
-
+        self.view_name = "today"
+        self._closed = False
+        self._settings: Optional[SettingsView] = None
+        self._collection_records: list[dict] = []
+        self._selected_record: Optional[dict] = None
+        self._poll_after = self._event_after = None
+        self._poll_ticks = 0
+        self._signature = ()
+        self.scale = max(1.0, root.winfo_fpixels("1i") / 96.0)
+        self.var_time = tk.StringVar(master=root)
+        self.var_auto = tk.BooleanVar(master=root)
+        self.var_catch_up = tk.BooleanVar(master=root)
+        self.var_autostart = tk.BooleanVar(master=root)
+        self.var_landscape = tk.BooleanVar(master=root)
+        self.var_caption = tk.BooleanVar(master=root)
+        self.var_multi = tk.StringVar(master=root)
+        self.var_style = tk.StringVar(master=root)
         root.title("每日欧洲油画壁纸")
-        root.configure(bg=BG)
-        root.minsize(660, 470)
-        # pythonw 启动时没有 stderr，Tk 默认会静默吞掉回调里的异常，
-        # 表现就是"点了按钮没反应"。这里改成写进日志文件。
+        p = lambda n: round(n * self.scale)
+        width = min(p(1260), root.winfo_screenwidth() - p(80))
+        height = min(p(820), root.winfo_screenheight() - p(110))
+        root.geometry(f"{width}x{height}+{max(0, (root.winfo_screenwidth()-width)//2)}+{max(0, (root.winfo_screenheight()-height)//2)}")
+        root.minsize(min(p(900), width), min(p(640), height))
         root.report_callback_exception = self._on_callback_error
+        root.protocol("WM_DELETE_WINDOW", root.destroy)
+        root.bind("<Destroy>", self._on_destroy, add=True)
         self._set_window_icon()
-        self._build_styles()
-        self._build_layout()
+        configure_styles(root, self.scale)
+        self.ui = GalleryView(root, self, self.scale)
+        self.ui.show("today")
         self.refresh()
-        root.after(150, self._drain_events)
+        self._event_after = root.after(150, self._drain_events)
+        self._poll_after = root.after(2500, self._poll_state)
+        root.after_idle(self._dark_titlebar)
 
-    # ------------------------------------------------------------------ 外观
-    def _set_window_icon(self) -> None:
+    def _set_window_icon(self):
         icon = paths.resource_path("assets/app.ico")
-        if not icon.exists():
+        if not icon.is_file():
             icon = paths.data_root() / "app.ico"
-        if icon.exists():
+        if icon.is_file():
             try:
                 self.root.iconbitmap(default=str(icon))
             except tk.TclError:
                 pass
 
-    def _build_styles(self) -> None:
-        style = ttk.Style()
+    def _dark_titlebar(self, window=None):
+        if self._closed:
+            return
+        target = window or self.root
+        if not target.winfo_exists():
+            return
         try:
-            style.theme_use("clam")
-        except tk.TclError:
+            from ctypes import wintypes
+            user32 = ctypes.windll.user32
+            user32.GetParent.argtypes = [wintypes.HWND]
+            user32.GetParent.restype = wintypes.HWND
+            handle = user32.GetParent(target.winfo_id()) or target.winfo_id()
+            value = ctypes.c_int(1)
+            setter = ctypes.windll.dwmapi.DwmSetWindowAttribute
+            setter.argtypes = [wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD]
+            setter(handle, 20, ctypes.byref(value), ctypes.sizeof(value))
+        except (OSError, AttributeError):
             pass
-        style.configure(".", background=BG, foreground=FG, font=("Microsoft YaHei UI", 10))
-        style.configure("TFrame", background=BG)
-        style.configure("Card.TFrame", background=CARD)
-        style.configure("TLabel", background=BG, foreground=FG)
-        style.configure("Card.TLabel", background=CARD, foreground=FG)
-        style.configure("Title.TLabel", background=CARD, foreground="#ffffff",
-                        font=("Microsoft YaHei UI", 15, "bold"))
-        style.configure("Meta.TLabel", background=CARD, foreground=MUTED)
-        style.configure("Accent.TLabel", background=BG, foreground=ACCENT)
-        style.configure("TButton", padding=(12, 7), font=("Microsoft YaHei UI", 10))
-        style.configure("Accent.TButton", padding=(14, 8), font=("Microsoft YaHei UI", 10, "bold"))
-        style.configure("TCheckbutton", background=BG, foreground=FG)
-        style.map("TCheckbutton", background=[("active", BG)])
-        style.configure("TCombobox", padding=4)
 
-    def _build_layout(self) -> None:
-        outer = ttk.Frame(self.root, padding=18)
-        outer.pack(fill="both", expand=True)
+    def _on_destroy(self, event):
+        if event.widget is not self.root:
+            return
+        self._closed = True
+        for token in (self._poll_after, self._event_after):
+            if token:
+                self.root.after_cancel(token)
 
-        # ---------------- 当前作品卡片 ----------------
-        card = ttk.Frame(outer, style="Card.TFrame", padding=14)
-        card.pack(fill="x")
-        card.columnconfigure(1, weight=1)
-
-        self.thumb = tk.Label(card, background="#000000", borderwidth=0)
-        self.thumb.grid(row=0, column=0, rowspan=4, sticky="nw", padx=(0, 16))
-
-        self.lbl_title = ttk.Label(card, text="还没有换过壁纸", style="Title.TLabel",
-                                   wraplength=380, justify="left")
-        self.lbl_title.grid(row=0, column=1, sticky="w")
-        self.lbl_artist = ttk.Label(card, text="", style="Card.TLabel",
-                                    font=("Microsoft YaHei UI", 12))
-        self.lbl_artist.grid(row=1, column=1, sticky="w", pady=(6, 0))
-        self.lbl_meta = ttk.Label(card, text="", style="Meta.TLabel",
-                                  wraplength=380, justify="left")
-        self.lbl_meta.grid(row=2, column=1, sticky="w", pady=(4, 0))
-        self.lbl_time = ttk.Label(card, text="", style="Meta.TLabel",
-                                  wraplength=380, justify="left")
-        self.lbl_time.grid(row=3, column=1, sticky="w", pady=(4, 0))
-
-        # ---------------- 主要操作 ----------------
-        actions = ttk.Frame(outer)
-        actions.pack(fill="x", pady=(16, 0))
-        self.btn_change = ttk.Button(actions, text="立刻换一张", style="Accent.TButton",
-                                     command=self.on_change)
-        self.btn_change.pack(side="left")
-        ttk.Button(actions, text="收藏", command=self.on_favorite).pack(side="left", padx=8)
-        ttk.Button(actions, text="查看详情", command=self.on_details).pack(side="left")
-        ttk.Button(actions, text="打开馆藏页面", command=self.on_open_page).pack(side="left", padx=8)
-
-        # ---------------- 自动更换设置 ----------------
-        opts = ttk.LabelFrame(outer, text=" 自动更换 ", padding=12)
-        opts.pack(fill="x", pady=(16, 0))
-
-        row1 = ttk.Frame(opts)
-        row1.pack(fill="x")
-        ttk.Label(row1, text="每天").pack(side="left")
-        self.var_time = tk.StringVar()
-        self.cmb_time = ttk.Combobox(row1, textvariable=self.var_time, values=list(TIME_PRESETS),
-                                     width=8, state="readonly")
-        self.cmb_time.pack(side="left", padx=6)
-        self.cmb_time.bind("<<ComboboxSelected>>", lambda _e: self.on_time_changed())
-        ttk.Label(row1, text="自动换一张").pack(side="left")
-
-        self.var_pause = tk.BooleanVar()
-        ttk.Checkbutton(row1, text="暂停自动更换", variable=self.var_pause,
-                        command=self.on_toggle_pause).pack(side="left", padx=24)
-
-        self.var_autostart = tk.BooleanVar()
-        ttk.Checkbutton(row1, text="开机自动启动", variable=self.var_autostart,
-                        command=self.on_toggle_autostart).pack(side="left")
-
-        row2 = ttk.Frame(opts)
-        row2.pack(fill="x", pady=(10, 0))
-        self.lbl_schedule = ttk.Label(row2, text="", style="Meta.TLabel")
-        self.lbl_schedule.pack(side="left")
-
-        row3 = ttk.Frame(opts)
-        row3.pack(fill="x", pady=(10, 0))
-        self.lbl_tray = ttk.Label(row3, text="", style="Meta.TLabel")
-        self.lbl_tray.pack(side="left")
-        ttk.Button(row3, text="启动后台托盘", command=self.on_start_tray).pack(side="left", padx=8)
-        ttk.Button(row3, text="把图标固定到任务栏", command=self.on_pin_tray).pack(side="left")
-
-        # ---------------- 底部状态 ----------------
-        bottom = ttk.Frame(outer)
-        bottom.pack(fill="both", expand=True, pady=(14, 0))
-        self.lbl_status = ttk.Label(bottom, text="就绪", style="Accent.TLabel")
-        self.lbl_status.pack(anchor="w")
-        self.lbl_catalog = ttk.Label(bottom, text="", style="Meta.TLabel", justify="left")
-        self.lbl_catalog.pack(anchor="w", pady=(4, 0))
-
-        links = ttk.Frame(bottom)
-        links.pack(fill="x", pady=(10, 0))
-        ttk.Button(links, text="打开壁纸文件夹", command=self.on_open_dir).pack(side="left")
-        ttk.Button(links, text="打开日志", command=lambda: self._open(paths.log_path())).pack(side="left", padx=8)
-        ttk.Button(links, text="重建作品库", command=self.on_rebuild_catalog).pack(side="left")
-        ttk.Button(links, text="退出", command=self.root.destroy).pack(side="right")
-
-    # ------------------------------------------------------------------ 工具
-    def _on_callback_error(self, exc_type, exc_value, exc_tb) -> None:
-        """任何界面回调抛异常都要留下痕迹，否则用户只会看到"没反应"。"""
+    def _on_callback_error(self, exc_type, exc_value, exc_tb):
         text = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
         self.log.error("界面回调出错：\n%s", text)
-        self.set_status(f"出错了：{exc_value}（详情见日志）")
-        try:
-            messagebox.showerror(
-                "界面出错",
-                f"{exc_type.__name__}: {exc_value}\n\n完整信息已写入日志，"
-                "可通过「打开日志」查看。",
-                parent=self.root,
-            )
-        except tk.TclError:
-            pass
+        self.set_status(f"操作未完成：{exc_value}")
+        messagebox.showerror("操作未完成", str(exc_value), parent=self.root)
 
     @staticmethod
-    def _open(path: Path) -> None:
-        target = Path(path)
-        if target.exists():
-            import os
+    def _open(path: Path):
+        if path.exists():
+            os.startfile(str(path))  # noqa: S606
 
-            os.startfile(str(target))  # noqa: S606
+    def set_status(self, text):
+        if not self._closed:
+            self.ui.status_label.configure(text=str(text)[:150])
 
-    def set_status(self, text: str) -> None:
-        self.lbl_status.configure(text=text)
-
-    def _set_busy(self, busy: bool, text: str = "") -> None:
+    def _set_busy(self, busy, text=""):
         self.busy = busy
         state = "disabled" if busy else "normal"
-        self.btn_change.configure(state=state)
+        self.ui.change_button.configure(state=state, text="正在处理…" if busy else "↻  换一幅画")
+        self.ui.favorite_button.configure(state=state)
+        self.ui.apply_button.configure(state="disabled" if busy or not self._selected_record else "normal")
+        if self._settings and self._settings.window.winfo_exists():
+            self._settings.rebuild_button.configure(state=state)
         if text:
             self.set_status(text)
 
-    def run_task(self, label: str, func: Callable[[], Any]) -> None:
-        """在后台线程里跑耗时操作，完成后回到主线程刷新界面。"""
+    def run_task(self, label: str, func: Callable[[], Any], on_done: Optional[Callable] = None):
         if self.busy:
+            self.set_status("上一个操作还在进行，请稍候")
             return
         self._set_busy(True, label)
 
-        def worker() -> None:
+        def worker():
             try:
                 func()
             except Exception as exc:  # noqa: BLE001
                 self.log.exception("操作失败：%s", exc)
-                self.events.put(("error", f"{label}失败：{exc}"))
+                self.events.put(("error", f"{label}未完成：{exc}"))
             else:
-                self.events.put(("done", label))
+                self.events.put(("done", (label, on_done)))
 
-        threading.Thread(target=worker, daemon=True).start()
+        threading.Thread(target=worker, name="dop-ui-task", daemon=True).start()
 
-    def _drain_events(self) -> None:
+    def _progress(self, text):
+        self.events.put(("progress", text))
+
+    def _drain_events(self):
+        if self._closed:
+            return
         try:
             while True:
                 kind, payload = self.events.get_nowait()
-                if kind == "error":
-                    self._set_busy(False, str(payload))
-                    messagebox.showerror("出错了", str(payload), parent=self.root)
+                if kind == "progress":
+                    self.set_status(payload)
+                elif kind == "error":
+                    self._set_busy(False, payload)
+                    messagebox.showerror("操作未完成", payload, parent=self.root)
                 else:
-                    self._set_busy(False, f"{payload}完成")
+                    label, on_done = payload
+                    self._set_busy(False, f"{label}完成")
                     self.refresh()
+                    if on_done:
+                        on_done()
         except queue.Empty:
             pass
-        self.root.after(150, self._drain_events)
+        self._event_after = self.root.after(150, self._drain_events)
 
-    # ------------------------------------------------------------------ 刷新
-    def refresh(self) -> None:
+    def _state_signature(self):
+        values = []
+        for path in (paths.current_path(), paths.config_path(), paths.favorites_index_path(),
+                     paths.history_path(), paths.catalog_path()):
+            try:
+                values.append(path.stat().st_mtime_ns)
+            except OSError:
+                values.append(0)
+        return tuple(values)
+
+    def _poll_state(self):
+        if self._closed:
+            return
+        self._poll_ticks += 1
+        if not self.busy and (self._state_signature() != self._signature or self._poll_ticks % 12 == 0):
+            self.refresh()
+        self._poll_after = self.root.after(2500, self._poll_state)
+
+    # ------------------------------------------------------------------ 当前展出
+    def refresh(self):
         self.refresh_current()
         self.refresh_settings()
         self.refresh_catalog()
+        if self.view_name != "today":
+            self._refresh_collection()
+        self._signature = self._state_signature()
 
-    def refresh_current(self) -> None:
+    def refresh_current(self):
         current = self.engine.current()
+        self.ui.preview.set_record(current)
         if not current:
-            self.lbl_title.configure(text="还没有换过壁纸")
-            self.lbl_artist.configure(text="点「立刻换一张」开始")
-            self.lbl_meta.configure(text="")
-            self.lbl_time.configure(text="")
-            # 没有 image 时 Label 的宽高单位是字符/行，不能用像素尺寸。
-            # 保留真正的占位图片，也保持引用，避免首次运行把窗口撑成黑屏。
-            self._photo = ImageTk.PhotoImage(
-                Image.new("RGB", (260, 150), (14, 14, 18)), master=self.root
-            )
-            self.thumb.configure(image=self._photo, width=260, height=150)
+            self.ui.title_label.configure(text="还没有展出的画作")
+            self.ui.artist_label.configure(text="从博物馆的欧洲古典绘画中，遇见第一幅。")
+            self.ui.favorite_button.configure(text="♡ 收藏")
             return
+        self.ui.title_label.configure(text=current.get("title") or "无题")
+        parts = [current.get("artist") or "佚名", current.get("date_display"), current.get("museum")]
+        self.ui.artist_label.configure(text="   ·   ".join(str(part) for part in parts if part))
+        saved = any(item.get("key") == current.get("key") for item in self._favorite_records())
+        self.ui.favorite_button.configure(text="♥ 已收藏" if saved else "♡ 收藏")
 
-        self.lbl_title.configure(text=current.get("title") or "无题")
-        artist = current.get("artist") or "佚名"
-        self.lbl_artist.configure(text=f"{artist}    {current.get('date_display') or ''}".strip())
-        self.lbl_meta.configure(
-            text=f"{current.get('museum') or ''}    {current.get('license') or ''}"
-        )
-        try:
-            size = human_size(Path(str(current.get("source_file") or "")).stat().st_size)
-        except OSError:
-            size = "—"
-        self.lbl_time.configure(
-            text=f"更换于 {current.get('time_display')}    分辨率 {current.get('resolution')}"
-                 f"    原图 {size}"
-        )
-
-        # 缩略图：用 draft() 让 JPEG 解码器直接降采样，避免解码整张 7K 大图。
-        # 优先用整张跨屏图，这样多屏时也能看到完整构图。
-        wallpaper_file = Path(str(current.get("canvas_file") or current.get("wallpaper_file") or ""))
-        if wallpaper_file.exists():
-            try:
-                with Image.open(wallpaper_file) as raw:
-                    raw.draft("RGB", (520, 520))
-                    img = raw.convert("RGB")
-                img.thumbnail((260, 150), RESAMPLE)
-                canvas = Image.new("RGB", (260, 150), (14, 14, 18))
-                canvas.paste(img, ((260 - img.width) // 2, (150 - img.height) // 2))
-                self._photo = ImageTk.PhotoImage(canvas)
-                self.thumb.configure(image=self._photo, width=260, height=150)
-            except (OSError, ValueError) as exc:
-                self.log.debug("缩略图加载失败：%s", exc)
-
-    def refresh_settings(self) -> None:
+    def refresh_settings(self):
+        from . import autostart
+        from .tray import tray_is_running
         cfg = load_config()
-        schedule = cfg.get("schedule") or {}
-        value = str(schedule.get("time") or "08:30")
-        hour, minute = parse_hhmm(value)
+        schedule, image = cfg.get("schedule") or {}, cfg.get("image") or {}
+        hour, minute = parse_hhmm(str(schedule.get("time") or "08:30"))
         value = f"{hour:02d}:{minute:02d}"
         self.var_time.set(value)
-        self.var_pause.set(bool(schedule.get("paused")))
-        from . import autostart
-
+        self.var_auto.set(not bool(schedule.get("paused")))
+        self.var_catch_up.set(bool(schedule.get("catch_up", True)))
         self.var_autostart.set(autostart.is_enabled())
-
-        now = datetime.now()
-        nxt = next_target(now, value)
-        current = self.engine.current()
-        last = (current or {}).get("time_display") or "从未"
-        if schedule.get("paused"):
-            self.lbl_schedule.configure(text=f"已暂停。上次更换：{last}")
+        self.var_landscape.set(bool((cfg.get("selection") or {}).get("landscape_only", True)))
+        self.var_caption.set(bool(image.get("show_caption", True)))
+        self.var_multi.set(next((name for name, key in self.multi_modes.items() if key == image.get("multi_monitor")), "每屏完整显示"))
+        self.var_style.set(next((name for name, key in self.image_styles.items() if key == image.get("style")), "完整显示"))
+        if self.var_auto.get():
+            now = datetime.now()
+            nxt = next_target(now, value)
+            when = "明天" if nxt.date() != now.date() else "今天"
+            text = f"◷  每天 {value} 自动更换   ·   下次，{when} {value}"
         else:
-            delta = nxt - now
-            hours = int(delta.total_seconds() // 3600)
-            minutes = int((delta.total_seconds() % 3600) // 60)
-            self.lbl_schedule.configure(
-                text=f"下次自动更换：{nxt.strftime('%m-%d %H:%M')}"
-                     f"（{hours} 小时 {minutes} 分后）    上次更换：{last}"
-            )
+            text = "◷  自动更换已暂停   ·   仍可手动换画"
+        self.ui.schedule_label.configure(text=text)
+        self.ui.pause_button.configure(text="暂停" if self.var_auto.get() else "恢复")
+        self.ui.landscape_label.configure(text="✓ 竖图已过滤" if self.var_landscape.get() else "允许所有画幅")
+        running = tray_is_running()
+        self.ui.tray_label.configure(text="●  后台运行中" if running else "○  后台未运行",
+                                     fg=MUTED if running else "#d5b193")
+        try:
+            monitors = wallpaper.get_monitors()
+            count = len(monitors)
+            all_4k = count and all(m.get("width", 0) >= 3840 and m.get("height", 0) >= 2160 for m in monitors)
+            self.ui.display_label.configure(text=f"{count} 块{' 4K ' if all_4k else ''}屏幕 · {self.var_multi.get()}")
+        except Exception:
+            self.ui.display_label.configure(text=self.var_multi.get())
 
-        from .tray import tray_is_running
-
-        if tray_is_running():
-            self.lbl_tray.configure(text="后台托盘：运行中（在任务栏右下角，可能收在 ^ 里）")
-        else:
-            self.lbl_tray.configure(text="后台托盘：未运行（每日自动更换需要它）")
-
-    def refresh_catalog(self) -> None:
-        from . import catalog as catalog_mod
-
+    def refresh_catalog(self):
         catalog = catalog_mod.load_catalog()
         if not catalog:
-            self.lbl_catalog.configure(text="作品库：尚未建立（第一次换壁纸时会自动抓取，约 2-4 分钟）")
+            self.ui.catalog_label.configure(text="作品库尚未建立 · 首次换画时自动准备")
             return
-        parts = " / ".join(
-            f"{name} {count}" for name, count in (catalog.get("per_source") or {}).items()
-        )
-        self.lbl_catalog.configure(
-            text=f"作品库：{catalog.get('total', 0)} 幅（{parts}）    年代 "
-                 f"{catalog.get('date_range', ['', ''])[0]}-{catalog.get('date_range', ['', ''])[1]}"
-                 f"    更新于 {catalog.get('generated_display')}"
-        )
+        dates = catalog.get("date_range") or [1300, 1800]
+        self.ui.catalog_label.configure(text=f"{catalog.get('total', 0):,} 幅馆藏作品 · {dates[0]}–{dates[1]} 年")
 
-    # ------------------------------------------------------------------ 动作
-    def on_change(self) -> None:
-        self.run_task("更换壁纸", lambda: self.engine.apply())
+    def on_change(self):
+        self.run_task("更换壁纸", lambda: self.engine.apply(progress=self._progress))
 
-    def on_favorite(self) -> None:
-        self.set_status("正在收藏当前作品…")
-        target = self.engine.favorite()
-        if target:
-            self.set_status(f"已收藏：{target.name}")
-            messagebox.showinfo("收藏成功", f"已保存到：\n{target}", parent=self.root)
-        else:
-            self.set_status("收藏失败：还没有可收藏的壁纸")
-            messagebox.showwarning("收藏失败", "还没有可收藏的壁纸。", parent=self.root)
-
-    def on_details(self) -> None:
+    def on_favorite(self):
         current = self.engine.current()
         if not current:
-            messagebox.showwarning("暂无信息", "还没有换过壁纸。", parent=self.root)
+            self.set_status("还没有可收藏的画作，请先换一幅画")
+            return
+        if any(item.get("key") == current.get("key") for item in self._favorite_records()):
+            self.set_status("这幅画已在「我的收藏」中")
+            return
+
+        def favorite():
+            if not self.engine.favorite(current):
+                raise RuntimeError("画作文件已不存在，请重新下载后再收藏")
+
+        self.run_task("收藏画作", favorite)
+
+    def on_details(self):
+        current = self.engine.current()
+        if not current:
+            self.set_status("还没有画作详情，请先换一幅画")
             return
         page = report.write_html(current)
-        self.set_status(f"详情页已生成：{page}")
         if not webbrowser.open(page.as_uri()):
-            self.set_status("详情页已生成，但没能自动打开浏览器")
-            messagebox.showinfo(
-                "详情页已生成",
-                f"没能自动打开浏览器，请手动打开：\n{page}",
-                parent=self.root,
-            )
+            messagebox.showinfo("详情页已生成", f"请手动打开：\n{page}", parent=self.root)
 
-    def on_open_page(self) -> None:
-        url = str((self.engine.current() or {}).get("page_url") or "").strip()
+    def _open_record_page(self, record):
+        url = str((record or {}).get("page_url") or "").strip()
         if not url:
-            messagebox.showwarning("暂无链接", "当前作品没有馆藏页面链接。", parent=self.root)
-            return
-        self.set_status(f"正在打开：{url}")
-        if not webbrowser.open(url):
-            self.set_status("没能自动打开浏览器")
-            messagebox.showinfo("请手动打开", f"没能自动打开浏览器，链接是：\n{url}", parent=self.root)
+            self.set_status("这幅画作没有馆藏页面链接")
+        elif not webbrowser.open(url):
+            messagebox.showinfo("馆藏页面", f"请手动打开：\n{url}", parent=self.root)
 
-    def on_open_dir(self) -> None:
+    def on_open_page(self):
+        self._open_record_page(self.engine.current())
+
+    def open_preview(self):
+        record = self.engine.current() if self.view_name == "today" else self._selected_record
+        if not record:
+            self.set_status("请先选择一幅画作")
+            return
+        window = tk.Toplevel(self.root)
+        window.title(str(record.get("title") or "画作预览"))
+        window.configure(bg=STAGE)
+        window.geometry(f"{round(1080*self.scale)}x{round(720*self.scale)}")
+        window.transient(self.root)
+        preview = ArtworkPreview(window, self.scale)
+        preview.pack(fill="both", expand=True)
+        preview.set_record(record)
+        window.after_idle(lambda: self._dark_titlebar(window))
+        window.bind("<Escape>", lambda _event: window.destroy())
+
+    # ------------------------------------------------------------------ 收藏与更换记录
+    def _favorite_records(self):
+        data = read_json(paths.favorites_index_path(), [])
+        return [item for item in data if isinstance(item, dict) and item.get("key")] if isinstance(data, list) else []
+
+    def show_view(self, name):
+        if name not in ("today", "favorites", "history"):
+            return
+        self.view_name = name
+        self.ui.show(name)
+        if name == "today":
+            self.refresh_current()
+        else:
+            self._refresh_collection()
+
+    def _refresh_collection(self):
+        previous = (self._selected_record or {}).get("key")
+        favorites = self.view_name == "favorites"
+        raw = self._favorite_records() if favorites else self.engine.get_history()
+        valid = [item for item in raw if isinstance(item, dict) and item.get("key")]
+        records = list(reversed(valid))
+        if favorites:
+            unique = {}
+            for item in records:
+                unique.setdefault(item["key"], item)
+            records = list(unique.values())
+        self._collection_records = records[:200]
+        self.ui.tree.delete(*self.ui.tree.get_children())
+        self.ui.collection_heading.configure(text="我的收藏" if favorites else "更换记录")
+        for index, item in enumerate(self._collection_records):
+            date = item.get("time_display") or ""
+            if favorites and item.get("favorited_at"):
+                try:
+                    date = datetime.fromtimestamp(float(item["favorited_at"])).strftime("%Y-%m-%d %H:%M")
+                except (TypeError, ValueError, OSError):
+                    pass
+            self.ui.tree.insert("", "end", iid=str(index), values=(
+                f"{item.get('title') or '无题'}  /  {item.get('artist') or '佚名'}",
+                str(date)[5:16] if len(str(date)) >= 16 else str(date)))
+        self.ui.collection_count.configure(text=f"显示最近 {len(self._collection_records)} 幅 · 共 {len(records)} 幅；选中只预览，不会换壁纸")
+        self.ui.collection_empty.place_forget()
+        if not self._collection_records:
+            self._selected_record = None
+            self.ui.collection_preview.set_record(None)
+            self.ui.collection_title.configure(text="还没有收藏" if favorites else "还没有更换记录")
+            self.ui.collection_meta.configure(text="在「正在展出」中收藏喜欢的画作。" if favorites else "换过的画作会出现在这里。")
+            self.ui.collection_empty.configure(text="收藏一幅喜欢的画作，\n以后可以从这里找到它。" if favorites else "换过的画作会出现在这里。")
+            self.ui.collection_empty.place(relx=.5, rely=.5, anchor="center")
+            self.ui.apply_button.configure(state="disabled")
+            return
+        selected = next((i for i, item in enumerate(self._collection_records) if item.get("key") == previous), 0)
+        self.ui.tree.selection_set(str(selected))
+        self.ui.tree.focus(str(selected))
+        self.on_collection_selected()
+
+    def on_collection_selected(self, _event=None):
+        selection = self.ui.tree.selection()
+        if not selection:
+            return
+        index = int(selection[0])
+        if index >= len(self._collection_records):
+            return
+        record = self._collection_records[index]
+        self._selected_record = record
+        self.ui.collection_preview.set_record(record)
+        self.ui.collection_title.configure(text=record.get("title") or "无题")
+        parts = [record.get("artist") or "佚名", record.get("date_display"), record.get("museum")]
+        self.ui.collection_meta.configure(text=" · ".join(str(part) for part in parts if part))
+        self.ui.apply_button.configure(state="disabled" if self.busy else "normal")
+
+    def on_apply_selected(self):
+        if not self._selected_record:
+            return
+        record = dict(self._selected_record)
+        # 旧历史不含备用图片地址，优先从现有目录补齐，不强制联网重建。
+        catalog = catalog_mod.load_catalog() or {}
+        work = next((item for item in catalog.get("works", []) if item.get("key") == record.get("key")), record)
+        self.run_task("应用画作", lambda: self.engine.apply(work=work, progress=self._progress),
+                      on_done=lambda: self.show_view("today"))
+
+    def on_selected_page(self):
+        self._open_record_page(self._selected_record)
+
+    # ------------------------------------------------------------------ 设置
+    def open_settings(self):
+        if self._settings and self._settings.window.winfo_exists():
+            self._settings.window.deiconify()
+            self._settings.window.lift()
+            self._settings.window.focus_set()
+            return
+        self.refresh_settings()
+        self._settings = SettingsView(self.root, self, self.scale)
+        self._dark_titlebar(self._settings.window)
+        self._set_busy(self.busy)
+
+    def _save_preference(self, section, key, value, text):
+        cfg = load_config()
+        cfg.setdefault(section, {})[key] = value
+        save_config(cfg)
+        self.set_status(text)
+        self.refresh_settings()
+
+    def on_time_changed(self):
+        self._save_preference("schedule", "time", self.var_time.get(), f"每日更换时间已设为 {self.var_time.get()}")
+
+    def on_auto_changed(self):
+        self._save_preference("schedule", "paused", not self.var_auto.get(),
+                              "已恢复自动更换" if self.var_auto.get() else "已暂停自动更换与壁纸守护")
+
+    def toggle_auto(self):
+        self.var_auto.set(not self.var_auto.get())
+        self.on_auto_changed()
+
+    def on_catch_up_changed(self):
+        self._save_preference("schedule", "catch_up", self.var_catch_up.get(), "已更新开机补换设置")
+
+    def on_landscape_changed(self):
+        self._save_preference("selection", "landscape_only", self.var_landscape.get(), "已更新画作方向筛选")
+
+    def on_caption_changed(self):
+        self._save_preference("image", "show_caption", self.var_caption.get(), "署名设置将在下次换画时应用")
+
+    def on_image_changed(self):
+        cfg = load_config()
+        cfg.setdefault("image", {}).update(
+            multi_monitor=self.multi_modes[self.var_multi.get()], style=self.image_styles[self.var_style.get()])
+        save_config(cfg)
+        self.set_status("画面设置将在下次换画时应用")
+        self.refresh_settings()
+
+    def on_toggle_autostart(self):
+        from . import autostart
+        want = self.var_autostart.get()
+
+        def change():
+            if want:
+                if not autostart.enable():
+                    raise RuntimeError("未能开启开机自动启动，请查看日志")
+            else:
+                autostart.disable()
+
+        self.run_task("设置开机启动", change)
+
+    def on_open_dir(self):
         self._open(paths.wallpaper_dir())
 
-    def on_time_changed(self) -> None:
-        value = self.var_time.get()
-        cfg = load_config()
-        cfg.setdefault("schedule", {})["time"] = value
-        save_config(cfg)
-        self.set_status(f"每日更换时间已设为 {value}")
-        self.refresh_settings()
-
-    def on_toggle_pause(self) -> None:
-        cfg = load_config()
-        cfg.setdefault("schedule", {})["paused"] = bool(self.var_pause.get())
-        save_config(cfg)
-        self.set_status("已暂停自动更换" if self.var_pause.get() else "已恢复自动更换")
-        self.refresh_settings()
-
-    def on_toggle_autostart(self) -> None:
-        from . import autostart
-
-        want = bool(self.var_autostart.get())
-        if want:
-            ok = autostart.enable()
-            self.set_status(
-                "已开启开机自动启动（登录时运行，每 10 分钟检查一次是否还活着）"
-                if ok
-                else "设置失败，请查看日志"
-            )
-        else:
-            autostart.disable()
-            self.set_status("已关闭开机自动启动")
-        self.refresh_settings()
-
-    def on_start_tray(self) -> None:
-        from .tray import tray_is_running
-
-        if tray_is_running():
-            self.set_status("后台托盘已经在运行了")
-            self.refresh_settings()
-            return
-        import subprocess
-
-        app = paths.app_root()
-        try:
-            subprocess.Popen(
-                paths.app_argv("tray"),
-                cwd=str(app),
-                creationflags=getattr(subprocess, "DETACHED_PROCESS", 0)
-                | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
-                close_fds=True,
-            )
-            self.set_status("已启动后台托盘")
-        except OSError as exc:
-            self.set_status(f"启动失败：{exc}")
+    def on_start_tray(self):
+        from .tray import start_tray_if_needed
+        started = start_tray_if_needed()
+        self.set_status("后台已启动" if started else "后台已经在运行")
         self.root.after(1500, self.refresh_settings)
 
-    def on_pin_tray(self) -> None:
-        found = wallpaper.promote_tray_icon()
-        if found:
-            messagebox.showinfo(
-                "已设为常显",
-                "已把通知区域图标设为常显。\n\n"
-                "如果任务栏上还是看不到，请注销后重新登录一次即可生效。",
-                parent=self.root,
-            )
+    def on_pin_tray(self):
+        if wallpaper.promote_tray_icon():
             self.set_status("已把托盘图标设为常显")
         else:
-            messagebox.showinfo(
-                "需要先让系统登记这个图标",
-                "Windows 还没有登记本程序的托盘图标，所以无法直接固定。\n\n"
-                "请这样做：\n"
-                "1. 点击任务栏右下角的 ^（向上箭头）展开「隐藏的图标」\n"
-                "2. 找到画框图标后，再用鼠标把它拖到任务栏上\n\n"
-                "拖过去之后，Windows 会永久记住这个位置。\n"
-                "（也可以点开一次 ^ 之后，再回来按一次本按钮）",
-                parent=self.root,
-            )
+            messagebox.showinfo("显示托盘图标", "展开任务栏右下角的 ^，把画框图标拖到任务栏上即可。", parent=self.root)
 
-    def on_rebuild_catalog(self) -> None:
-        if not messagebox.askyesno(
-            "重建作品库",
-            "会重新联网抓取三家博物馆的作品列表，大约需要 2-4 分钟。\n\n确定继续吗？",
-            parent=self.root,
-        ):
-            return
-        self.run_task(
-            "重建作品库",
-            lambda: self.engine.get_catalog(force=True),
-        )
+    def on_rebuild_catalog(self):
+        if messagebox.askyesno("重建作品库", "会重新联网抓取馆藏，通常需要约 10 分钟。\n\n重建期间保留当前壁纸，是否继续？", parent=self.root):
+            self.run_task("重建作品库", lambda: self.engine.get_catalog(force=True, progress=self._progress))
 
-    # ------------------------------------------------------------------ 首次运行
-    def maybe_first_run_setup(self) -> None:
-        """独立 exe 首次运行时，询问是否建立快捷方式与开机自启。"""
+    def maybe_first_run_setup(self):
         from . import autostart
         from .installer import install, is_setup_done, mark_setup_done
-
         if is_setup_done() or autostart.is_enabled():
             return
-        answer = messagebox.askyesno(
-            "完成安装",
-            "要不要把它装得更省心一点？\n\n"
-            "· 在桌面和开始菜单创建快捷方式\n"
-            "· 设置开机自动启动（这样每天才会自动换壁纸）\n\n"
-            "选「否」也能正常使用，只是需要手动打开、也不会自动换。",
-            parent=self.root,
-        )
-        if not answer:
+        if not messagebox.askyesno("完成安装", "是否创建快捷方式并开启开机自动启动？\n\n每天会在设定时间自动换画。", parent=self.root):
             mark_setup_done()
-            self.set_status("已跳过安装，可随时在界面里开启开机自启")
             return
-        result = install()
-        lines = []
-        if result["shortcuts"]:
-            lines.append("已创建快捷方式：")
-            lines += [f"    {Path(p).name}" for p in result["shortcuts"]]
-        else:
-            lines.append("快捷方式创建失败（不影响使用）")
-        lines.append("开机自动启动：" + ("已开启" if result["autostart"] else "设置失败"))
-        lines.append("")
-        lines.append("不需要时可以在界面上关掉开机自启，或运行 uninstall 卸载。")
-        messagebox.showinfo("安装完成", "\n".join(lines), parent=self.root)
-        self.set_status("已完成安装")
+        install()
+        self.set_status("已创建快捷方式并开启自动启动")
         self.refresh_settings()
 
 
 def run_gui() -> int:
     ensure_std_streams()
     paths.ensure_dirs()
-    secret = str(
-        ((load_config().get("sources") or {}).get("harvard") or {}).get("api_key") or ""
-    ).strip()
-    setup_logging(
-        paths.log_path(), console=True, secrets=[secret] if secret else None
-    )
+    secret = str(((load_config().get("sources") or {}).get("harvard") or {}).get("api_key") or "").strip()
+    setup_logging(paths.log_path(), console=True, secrets=[secret] if secret else None)
     wallpaper.set_dpi_aware()
     try:
         root = tk.Tk()
     except tk.TclError as exc:
         get_logger("gui").error("无法创建窗口：%s", exc)
-        print(f"无法创建图形界面：{exc}")
         return 1
     panel = ControlPanel(root)
     root.after(500, panel.maybe_first_run_setup)

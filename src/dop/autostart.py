@@ -46,6 +46,7 @@ def _run(args: list[str], timeout: int = 60) -> tuple[int, str]:
             encoding="utf-8",
             errors="replace",
             timeout=timeout,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
     except (OSError, ValueError) as exc:
