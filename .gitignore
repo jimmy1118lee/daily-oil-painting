@@ -1,0 +1,36 @@
+# 本地运行时产物（正常情况下它们都在 %LOCALAPPDATA%\DailyOilPainting 下，
+# 这里再兜一层，防止有人把数据目录指到仓库里）
+config.json
+state/
+cache/
+logs/
+wallpapers/
+favorites/
+archive/
+assets/app.ico
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.log
+.env
+.env.*
+tools/bug_audit_results.txt
+
+# 临时排查脚本
+_*.py
+_*.txt
+_*.bat
+_*.jpg
+_*.png
+_*.lnk
+
+# 分发件与构建中间产物（体积大，且可由源码重新生成）
+dist_dir/
+build/
+build_dir/
+build_dbg/
+build_fix/
+*.spec
