@@ -127,6 +127,21 @@ class TrayApp:
             self.log.debug("系统通知失败：%s", exc)
 
     # ------------------------------------------------------------------ 动作
+    def action_open_panel(self, *_args) -> None:
+        """单击托盘只打开控制面板；Tk 必须在独立进程的主线程运行。"""
+        import subprocess
+
+        try:
+            subprocess.Popen(
+                paths.app_argv("gui"),
+                cwd=str(paths.app_root()),
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                close_fds=True,
+            )
+        except OSError as exc:
+            self.log.exception("打开控制面板失败：%s", exc)
+            self._notify("控制面板打开失败，请查看日志", "每日名画")
+
     def _run_async(self, func, *args, **kwargs) -> None:
         if not self._busy.acquire(blocking=False):
             self.log.info("上一个任务还在进行，忽略本次操作")
@@ -361,7 +376,8 @@ class TrayApp:
             for value in TIME_PRESETS
         ]
         return Menu(
-            MenuItem("现在换一张", self.action_change, default=True),
+            MenuItem("打开控制面板", self.action_open_panel, default=True),
+            MenuItem("现在换一张", self.action_change),
             MenuItem("重新下载当前画作", self.action_redownload),
             MenuItem("收藏当前画作", self.action_favorite),
             MenuItem("查看画作详情", self.action_details),
@@ -456,6 +472,7 @@ class TrayApp:
                     "我已经在后台待命，每天会自动换一张欧洲油画。\n\n"
                     "如果任务栏上看不到我：点右下角的 ^ 展开「隐藏的图标」，"
                     "把画框图标拖到任务栏上即可常驻。\n"
+                    "单击画框图标打开控制面板；右键菜单可选择「现在换一张」。\n"
                     "也可以双击桌面上的「每日欧洲油画壁纸」打开控制面板。",
                     "每日欧洲油画壁纸已启动",
                 )
