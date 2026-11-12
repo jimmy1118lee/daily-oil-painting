@@ -19,7 +19,7 @@
 
 该修复已同步实际安装副本。两个任务修改前的 XML 保存在用户数据目录的 `state/task-actions-backup-20261112-171901/`，不纳入代码仓库。修改后 Triggers / Principals / Settings 与备份逐项一致；两个任务分别手动触发均返回 0，原十分钟频率保留。相关回归共 51 项通过。
 
-**GitHub 私有备份**：https://github.com/jimmy1118lee/daily-oil-painting ，分支 `main`。首次备份使用清理过敏感示例的当前快照；原始交接历史仅保留在本机 `master` 分支，不上传。个人配置、图片缓存和原始审计日志不在备份中。
+**GitHub 公开仓库**：https://github.com/jimmy1118lee/daily-oil-painting ，分支 `main`。2026-11-12 用户授权改为公开；公开前检查了两个远程分支及完整历史，未发现真实密钥或个人运行文件。首次备份使用清理过敏感示例的当前快照；原始交接历史仅保留在本机 `master` 分支，不上传。个人配置、图片缓存和原始审计日志不在仓库中。
 
 ---
 
