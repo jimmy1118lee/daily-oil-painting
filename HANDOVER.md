@@ -15,6 +15,10 @@
 
 **收藏应用修复（2026-11-11）**：竖图过滤仅限制自动/随机选画，显式 `Engine.apply(work=...)` 不受限制。手动应用优先使用本地收藏原图，兼容旧收藏命名；只剩成品也可离线应用且不重复署名。GUI 补齐作品目录元数据时保留收藏路径，新收藏索引记录 `favorite_source_file`；不迁移或删除既有收藏文件。
 
+**定时闪窗修复（2026-11-12）**：根因是两个计划任务直接执行 `watchdog.bat`，即使脚本内部使用 pythonw，批处理入口仍会创建 cmd 窗口。改为独立 Execute / Arguments / WorkingDirectory 动作，直接启动 pythonw（打包时启动窗口版 exe）执行 watchdog。已有任务通过 `Set-ScheduledTask -Action` 只更新动作，保留触发器、身份与设置；首次安装才建立默认登录与十分钟看护计划。`_run` 的 CREATE_NO_WINDOW 只负责程序内启动的子进程，不能替代本修复。旧脚本可保留用于回退，任务不再引用它。回归：`python tools/test_autostart.py`。
+
+该修复已同步实际安装副本。两个任务修改前的 XML 保存在用户数据目录的 `state/task-actions-backup-20261112-171901/`，不纳入代码仓库。修改后 Triggers / Principals / Settings 与备份逐项一致；两个任务分别手动触发均返回 0，原十分钟频率保留。相关回归共 51 项通过。
+
 **GitHub 私有备份**：https://github.com/jimmy1118lee/daily-oil-painting ，分支 `main`。首次备份使用清理过敏感示例的当前快照；原始交接历史仅保留在本机 `master` 分支，不上传。个人配置、图片缓存和原始审计日志不在备份中。
 
 ---
@@ -64,7 +68,7 @@ Python 3.12.10 位于 `C:\Users\v_djyjli\AppData\Local\Programs\Python\Python312
 | 成品壁纸 | `…\wallpapers\`（保留最近 12 个文件） |
 | 分发件 | 仓库 `dist_dir\`（独立版 zip 30 MB + 源码 zip 118 KB） |
 | 计划任务 | `DailyOilPainting`（登录时）、`DailyOilPainting-Watchdog`（每 10 分钟） |
-| 看门狗脚本 | `%LOCALAPPDATA%\DailyOilPainting\watchdog.bat` |
+| 看门狗动作 | `pythonw.exe "…\main.py" watchdog`，工作目录为安装目录；旧 `watchdog.bat` 不再被任务引用 |
 
 **改完代码要同步到安装副本**：`python src\bootstrap.py install --no-launch`
 （会把源码复制到 `%LOCALAPPDATA%\Programs\DailyOilPainting` 并重设自启/快捷方式）。

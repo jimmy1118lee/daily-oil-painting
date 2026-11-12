@@ -12,13 +12,13 @@
 * ``DailyOilPainting``          —— 登录时触发
 * ``DailyOilPainting-Watchdog`` —— 每 10 分钟触发，发现托盘不在就跑起来
 
-两个任务都执行同一个短命的 watchdog 脚本（几十毫秒内退出），
-托盘本身由它"派生"出去，这样不会有"任务运行超过 72 小时被结束"的问题。
+两个任务直接用 pythonw（或窗口版 exe）执行 watchdog，不经 cmd / bat。
+watchdog 很快退出，托盘由它派生出去，避免任务超时终止后台程序。
 """
 
 from __future__ import annotations
 
-import os
+import base64
 import subprocess
 from pathlib import Path
 
@@ -53,32 +53,48 @@ def _run(args: list[str], timeout: int = 60) -> tuple[int, str]:
         return 1, str(exc)
 
 
-# --------------------------------------------------------------------------- 看门狗脚本
+# --------------------------------------------------------------------------- 旧版本脚本（仅供卸载清理）
 def shim_path() -> Path:
     return paths.data_root() / "watchdog.bat"
 
 
-def _write_shim() -> Path:
-    """写一个最小的 .bat 来执行 watchdog。
-
-    这样计划任务的动作只是一个普通文件路径，不含任何内部引号，
-    彻底避免 schtasks 解析参数时的各种意外。
-    """
-    argv = paths.app_argv("watchdog")
-    quoted = " ".join(f'"{a}"' if " " in a else a for a in argv)
-    content = "@echo off\r\n" + quoted + "\r\n"
-    target = shim_path()
-    target.parent.mkdir(parents=True, exist_ok=True)
-    with open(target, "w", encoding="ascii", newline="") as fh:
-        fh.write(content)
-    return target
+def _ps_literal(value: str) -> str:
+    """把路径或参数作为 PowerShell 字符串值，不作为脚本代码。"""
+    return "'" + str(value).replace("'", "''") + "'"
 
 
 # --------------------------------------------------------------------------- 计划任务
-def _create_task(name: str, shim: Path, schedule: list[str]) -> bool:
-    code, out = _run(
-        ["schtasks", "/create", "/tn", name, "/tr", str(shim), *schedule, "/f"]
+def _create_task(name: str, *, logon: bool) -> bool:
+    """独立设置程序/参数，避免批处理闪窗和 schtasks /tr 的多层引号问题。
+
+    已有任务只更新 Action，保留原触发器、身份与设置；首次安装才创建它们。
+    """
+    argv = paths.app_argv("watchdog")
+    arguments = subprocess.list2cmdline(argv[1:])
+    trigger = (
+        "New-ScheduledTaskTrigger -AtLogOn -User $taskIdentity"
+        if logon else
+        f"New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval ([TimeSpan]::FromMinutes({WATCHDOG_MINUTES}))"
     )
+    script = f"""
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+$taskName = {_ps_literal(name)}
+$taskAction = New-ScheduledTaskAction -Execute {_ps_literal(argv[0])} -Argument {_ps_literal(arguments)} -WorkingDirectory {_ps_literal(str(paths.app_root()))}
+$existingTask = Get-ScheduledTask -TaskName $taskName -TaskPath '\\' -ErrorAction SilentlyContinue
+if ($null -ne $existingTask) {{
+    Set-ScheduledTask -TaskName $taskName -TaskPath '\\' -Action $taskAction | Out-Null
+}} else {{
+    $taskIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+    $taskTrigger = {trigger}
+    $taskPrincipal = New-ScheduledTaskPrincipal -UserId $taskIdentity -LogonType Interactive -RunLevel Limited
+    $taskSettings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew
+    Register-ScheduledTask -TaskName $taskName -TaskPath '\\' -Action $taskAction -Trigger $taskTrigger -Principal $taskPrincipal -Settings $taskSettings | Out-Null
+}}
+"""
+    # EncodedCommand 避免中文路径被系统代码页破坏；不会产生 .bat 包装。
+    encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
+    code, out = _run(["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded])
     if code != 0:
         get_logger("autostart").warning(
             "创建计划任务 %s 失败：%s", name, out.strip()[:200]
@@ -141,17 +157,14 @@ def _ensure_startup_approved_enabled() -> None:
 # --------------------------------------------------------------------------- 对外接口
 def enable() -> bool:
     """开启开机自启（计划任务为主，Run 键为辅）。"""
-    shim = _write_shim()
-    ok_logon = _create_task(LOGON_TASK, shim, ["/sc", "onlogon"])
-    ok_watch = _create_task(
-        WATCHDOG_TASK, shim, ["/sc", "minute", "/mo", str(WATCHDOG_MINUTES)]
-    )
+    ok_logon = _create_task(LOGON_TASK, logon=True)
+    ok_watch = _create_task(WATCHDOG_TASK, logon=False)
     _set_run_value(paths.launch_command("tray", "--quiet"))
     _ensure_startup_approved_enabled()
     ok = ok_logon and ok_watch
     if ok:
         get_logger("autostart").info(
-            "已设置开机自启：登录时启动，并且每 %d 分钟检查一次", WATCHDOG_MINUTES
+            "已设置无控制台自启：登录任务与定时看护已就绪（保留已有计划）"
         )
     return ok
 
